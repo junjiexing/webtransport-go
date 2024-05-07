@@ -198,6 +198,14 @@ func (s *Server) Upgrade(w http.ResponseWriter, r *http.Request) (*Session, erro
 	return s.conns.AddSession(conn, sessID, str), nil
 }
 
+func (s *Server) RemoveSession(session *Session) {
+	s.conns.mx.Lock()
+	defer s.conns.mx.Unlock()
+
+	connTracingID := session.qconn.Context().Value(quic.ConnectionTracingKey).(quic.ConnectionTracingID)
+	s.conns.maybeDelete(connTracingID, session.sessionID)
+}
+
 // copied from https://github.com/gorilla/websocket
 func checkSameOrigin(r *http.Request) bool {
 	origin := r.Header.Get("Origin")

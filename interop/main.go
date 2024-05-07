@@ -63,6 +63,7 @@ func main() {
 			return
 		}
 		runUnidirectionalTest(conn)
+		s.RemoveSession(conn)
 	})
 	if err := s.ListenAndServe(); err != nil {
 		log.Fatal(err)
