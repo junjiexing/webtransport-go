@@ -2,52 +2,28 @@ package webtransport_test
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/tls"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
-	"os"
 	"strconv"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"golang.org/x/exp/rand"
+
 	"github.com/quic-go/webtransport-go"
 
 	"github.com/quic-go/quic-go"
 	"github.com/quic-go/quic-go/http3"
-	"github.com/quic-go/quic-go/logging"
 	"github.com/quic-go/quic-go/qlog"
 
 	"github.com/stretchr/testify/require"
 )
-
-// create a qlog file in QLOGDIR, if that environment variable is set
-func getQlogger(t *testing.T) func(context.Context, logging.Perspective, quic.ConnectionID) *logging.ConnectionTracer {
-	tracer := func(ctx context.Context, p logging.Perspective, connID quic.ConnectionID) *logging.ConnectionTracer {
-		qlogDir := os.Getenv("QLOGDIR")
-		if qlogDir == "" {
-			return nil
-		}
-		if _, err := os.Stat(qlogDir); os.IsNotExist(err) {
-			require.NoError(t, os.MkdirAll(qlogDir, 0755))
-		}
-		role := "server"
-		if p == logging.PerspectiveClient {
-			role = "client"
-		}
-		filename := fmt.Sprintf("./%s/log_%x_%s.qlog", qlogDir, connID, role)
-		t.Log("creating", filename)
-		f, err := os.Create(filename)
-		require.NoError(t, err)
-		return qlog.NewConnectionTracer(f, p, connID)
-	}
-	return tracer
-}
 
 func runServer(t *testing.T, s *webtransport.Server) (addr *net.UDPAddr, close func()) {
 	laddr, err := net.ResolveUDPAddr("udp", "localhost:0")
@@ -71,17 +47,15 @@ func establishSession(t *testing.T, handler func(*webtransport.Session)) (sess *
 	s := &webtransport.Server{
 		H3: http3.Server{
 			TLSConfig:  tlsConf,
-			QuicConfig: &quic.Config{Tracer: getQlogger(t)},
+			QUICConfig: &quic.Config{Tracer: qlog.DefaultTracer, EnableDatagrams: true},
 		},
 	}
 	addHandler(t, s, handler)
 
 	addr, closeServer := runServer(t, s)
 	d := webtransport.Dialer{
-		RoundTripper: &http3.RoundTripper{
-			TLSClientConfig: &tls.Config{RootCAs: certPool},
-			QuicConfig:      &quic.Config{Tracer: getQlogger(t)},
-		},
+		TLSClientConfig: &tls.Config{RootCAs: certPool},
+		QUICConfig:      &quic.Config{Tracer: qlog.DefaultTracer, EnableDatagrams: true},
 	}
 	defer d.Close()
 	url := fmt.Sprintf("https://localhost:%d/webtransport", addr.Port)
@@ -91,7 +65,7 @@ func establishSession(t *testing.T, handler func(*webtransport.Session)) (sess *
 	return sess, func() {
 		closeServer()
 		s.Close()
-		d.RoundTripper.Close()
+		d.Close()
 	}
 }
 
@@ -221,9 +195,9 @@ func TestStreamsImmediateClose(t *testing.T) {
 
 	t.Run("unidirectional", func(t *testing.T) {
 		t.Run("client-initiated", func(t *testing.T) {
-			sess, closeServer := establishSession(t, func(c *webtransport.Session) {
-				defer c.CloseWithError(0, "")
-				str, err := c.AcceptUniStream(context.Background())
+			sess, closeServer := establishSession(t, func(sess *webtransport.Session) {
+				defer sess.CloseWithError(0, "")
+				str, err := sess.AcceptUniStream(context.Background())
 				require.NoError(t, err)
 				n, err := str.Read([]byte{0})
 				require.Zero(t, n)
@@ -238,8 +212,8 @@ func TestStreamsImmediateClose(t *testing.T) {
 		})
 
 		t.Run("server-initiated", func(t *testing.T) {
-			sess, closeServer := establishSession(t, func(c *webtransport.Session) {
-				str, err := c.OpenUniStream()
+			sess, closeServer := establishSession(t, func(sess *webtransport.Session) {
+				str, err := sess.OpenUniStream()
 				require.NoError(t, err)
 				require.NoError(t, str.Close())
 			})
@@ -342,10 +316,8 @@ func TestMultipleClients(t *testing.T) {
 		go func() {
 			defer wg.Done()
 			d := webtransport.Dialer{
-				RoundTripper: &http3.RoundTripper{
-					TLSClientConfig: &tls.Config{RootCAs: certPool},
-					QuicConfig:      &quic.Config{Tracer: getQlogger(t)},
-				},
+				TLSClientConfig: &tls.Config{RootCAs: certPool},
+				QUICConfig:      &quic.Config{Tracer: qlog.DefaultTracer, EnableDatagrams: true},
 			}
 			defer d.Close()
 			url := fmt.Sprintf("https://localhost:%d/webtransport", addr.Port)
@@ -360,6 +332,7 @@ func TestMultipleClients(t *testing.T) {
 
 func TestStreamResetError(t *testing.T) {
 	const errorCode webtransport.StreamErrorCode = 127
+	strChan := make(chan webtransport.Stream, 1)
 	sess, closeServer := establishSession(t, func(sess *webtransport.Session) {
 		for {
 			str, err := sess.AcceptStream(context.Background())
@@ -368,10 +341,12 @@ func TestStreamResetError(t *testing.T) {
 			}
 			str.CancelRead(errorCode)
 			str.CancelWrite(errorCode)
+			strChan <- str
 		}
 	})
 	defer closeServer()
 
+	// client side
 	str, err := sess.OpenStream()
 	require.NoError(t, err)
 	_, err = str.Write([]byte("foobar"))
@@ -381,32 +356,41 @@ func TestStreamResetError(t *testing.T) {
 	var strErr *webtransport.StreamError
 	require.True(t, errors.As(err, &strErr))
 	require.Equal(t, strErr.ErrorCode, errorCode)
+	require.True(t, strErr.Remote)
+
+	// server side
+	str = <-strChan
+	_, err = str.Read([]byte{0})
+	require.Error(t, err)
+	require.True(t, errors.As(err, &strErr))
+	require.Equal(t, strErr.ErrorCode, errorCode)
+	require.False(t, strErr.Remote)
 }
 
 func TestShutdown(t *testing.T) {
 	done := make(chan struct{})
 	sess, closeServer := establishSession(t, func(sess *webtransport.Session) {
 		sess.CloseWithError(1337, "foobar")
-		var connErr *webtransport.ConnectionError
+		var sessErr *webtransport.SessionError
 		_, err := sess.OpenStream()
-		require.True(t, errors.As(err, &connErr))
-		require.False(t, connErr.Remote)
-		require.Equal(t, webtransport.SessionErrorCode(1337), connErr.ErrorCode)
-		require.Equal(t, "foobar", connErr.Message)
+		require.True(t, errors.As(err, &sessErr))
+		require.False(t, sessErr.Remote)
+		require.Equal(t, webtransport.SessionErrorCode(1337), sessErr.ErrorCode)
+		require.Equal(t, "foobar", sessErr.Message)
 		_, err = sess.OpenUniStream()
-		require.True(t, errors.As(err, &connErr))
-		require.False(t, connErr.Remote)
+		require.True(t, errors.As(err, &sessErr))
+		require.False(t, sessErr.Remote)
 
 		close(done) // don't defer this, the HTTP handler catches panics
 	})
 	defer closeServer()
 
-	var connErr *webtransport.ConnectionError
+	var sessErr *webtransport.SessionError
 	_, err := sess.AcceptStream(context.Background())
-	require.True(t, errors.As(err, &connErr))
-	require.True(t, connErr.Remote)
-	require.Equal(t, webtransport.SessionErrorCode(1337), connErr.ErrorCode)
-	require.Equal(t, "foobar", connErr.Message)
+	require.True(t, errors.As(err, &sessErr))
+	require.True(t, sessErr.Remote)
+	require.Equal(t, webtransport.SessionErrorCode(1337), sessErr.ErrorCode)
+	require.Equal(t, "foobar", sessErr.Message)
 	_, err = sess.AcceptUniStream(context.Background())
 	require.Error(t, err)
 	<-done
@@ -435,8 +419,8 @@ func TestOpenStreamSyncShutdown(t *testing.T) {
 		require.Eventually(t, func() bool { return len(errChan) == num }, scaleDuration(100*time.Millisecond), 10*time.Millisecond)
 		for i := 0; i < num; i++ {
 			err := <-errChan
-			var connErr *webtransport.ConnectionError
-			require.ErrorAs(t, err, &connErr)
+			var sessErr *webtransport.SessionError
+			require.ErrorAs(t, err, &sessErr)
 		}
 	}
 
@@ -522,10 +506,8 @@ func TestCheckOrigin(t *testing.T) {
 			defer closeServer()
 
 			d := webtransport.Dialer{
-				RoundTripper: &http3.RoundTripper{
-					TLSClientConfig: &tls.Config{RootCAs: certPool},
-					QuicConfig:      &quic.Config{Tracer: getQlogger(t)},
-				},
+				TLSClientConfig: &tls.Config{RootCAs: certPool},
+				QUICConfig:      &quic.Config{Tracer: qlog.DefaultTracer, EnableDatagrams: true},
 			}
 			defer d.Close()
 			url := fmt.Sprintf("https://localhost:%d/webtransport", addr.Port)
@@ -613,4 +595,58 @@ func TestWriteCloseRace(t *testing.T) {
 	<-ready
 	<-ready
 	close(ch)
+}
+
+func TestDatagrams(t *testing.T) {
+	const num = 100
+	var mx sync.Mutex
+	m := make(map[string]bool, num)
+
+	var counter int
+	done := make(chan struct{})
+	serverErrChan := make(chan error, 1)
+	sess, closeServer := establishSession(t, func(sess *webtransport.Session) {
+		defer close(done)
+		for {
+			b, err := sess.ReceiveDatagram(context.Background())
+			if err != nil {
+				return
+			}
+			mx.Lock()
+			if _, ok := m[string(b)]; !ok {
+				serverErrChan <- errors.New("received unexpected datagram")
+				return
+			}
+			m[string(b)] = true
+			mx.Unlock()
+			counter++
+		}
+	})
+	defer closeServer()
+
+	errChan := make(chan error, 1)
+
+	for i := 0; i < num; i++ {
+		b := make([]byte, 800)
+		rand.Read(b)
+		mx.Lock()
+		m[string(b)] = false
+		mx.Unlock()
+		if err := sess.SendDatagram(b); err != nil {
+			break
+		}
+	}
+	time.Sleep(scaleDuration(10 * time.Millisecond))
+	sess.CloseWithError(0, "")
+	select {
+	case err := <-serverErrChan:
+		t.Fatal(err)
+	case err := <-errChan:
+		t.Fatal(err)
+	case <-done:
+		t.Logf("sent: %d, received: %d", num, counter)
+		require.Greater(t, counter, num*4/5)
+	case <-time.After(5 * time.Second):
+		t.Fatal("timeout")
+	}
 }
