@@ -202,7 +202,8 @@ func (s *Server) RemoveSession(session *Session) {
 	s.conns.mx.Lock()
 	defer s.conns.mx.Unlock()
 
-	s.conns.maybeDelete(session.qconn, session.sessionID)
+	connTracingID := session.qconn.Context().Value(quic.ConnectionTracingKey).(quic.ConnectionTracingID)
+	s.conns.maybeDelete(connTracingID, session.sessionID)
 }
 
 // copied from https://github.com/gorilla/websocket
