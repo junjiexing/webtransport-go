@@ -100,8 +100,8 @@ func (d *Dialer) Dial(ctx context.Context, urlStr string, reqHdr http.Header) (*
 	if err != nil {
 		return nil, nil, err
 	}
-	rt := &http3.SingleDestinationRoundTripper{
-		Connection:      qconn,
+
+	rt := http3.Transport{
 		EnableDatagrams: true,
 		StreamHijacker: func(ft http3.FrameType, connTracingID quic.ConnectionTracingID, str quic.Stream, e error) (hijacked bool, err error) {
 			if isWebTransportError(e) {
@@ -129,7 +129,7 @@ func (d *Dialer) Dial(ctx context.Context, urlStr string, reqHdr http.Header) (*
 		},
 	}
 
-	conn := rt.Start()
+	conn := rt.NewClientConn(qconn)
 	select {
 	case <-conn.ReceivedSettings():
 	case <-d.ctx.Done():
@@ -150,7 +150,7 @@ func (d *Dialer) Dial(ctx context.Context, urlStr string, reqHdr http.Header) (*
 		return nil, nil, errNoWebTransport
 	}
 
-	requestStr, err := rt.OpenRequestStream(ctx) // TODO: put this on the Connection (maybe introduce a ClientConnection?)
+	requestStr, err := conn.OpenRequestStream(ctx) // TODO: put this on the Connection (maybe introduce a ClientConnection?)
 	if err != nil {
 		return nil, nil, err
 	}
